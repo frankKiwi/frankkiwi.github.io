@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Screen Mirror Cast Receiver</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #000; overflow: hidden; }
+        #video {
+            width: 100vw;
+            height: 100vh;
+            object-fit: contain;
+            background: #000;
+        }
+        #status {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: white;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 15px 30px;
+            border-radius: 10px;
+            font-size: 18px;
+            z-index: 1000;
+        }
+        #status.connected { background: rgba(0, 150, 0, 0.8); }
+        #status.error { background: rgba(200, 0, 0, 0.8); }
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body>
+    <video id="video" autoplay playsinline muted></video>
+    <div id="status">等待连接...</div>
+
+    <!-- Google Cast Receiver SDK -->
+    <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+
+    <script>
+        const video = document.getElementById('video');
+        const status = document.getElementById('status');
+
+        let pc = null;
+        let ws = null;
+        let signalingServerIP = null;
+
+        // Cast Receiver 初始化
+        const context = cast.framework.CastReceiverContext.getInstance();
+        const playerManager = context.getPlayerManager();
+
+        // 监听自定义消息（从手机 App 发送的信令服务器 IP）
+        const CUSTOM_CHANNEL = 'urn:x-cast:com.screenmirror.webrtc';
+
+        context.addCustomMessageListener(CUSTOM_CHANNEL, (event) => {
+            console.log('收到自定义消息:', event.data);
+            const data = event.data;
+
+            if (data.type === 'start' && data.signalingIP) {
+                signalingServerIP = data.signalingIP;
+                status.textContent = '正在连接 WebRTC...';
+                connectWebRTC(signalingServerIP);
+            } else if (data.type === 'stop') {
+                closeWebRTC();
+            }
+        });
+
+        // 启动 Cast Receiver
+        const options = new cast.framework.CastReceiverOptions();
+        options.disableIdleTimeout = true;
+        context.start(options);
+
+        console.log('Cast Receiver 已启动');
+
+        // WebRTC 连接
+        function connectWebRTC(ip) {
+            console.log('连接信令服务器:', ip);
+
+            // 创建 WebSocket 连接到手机的信令服务器
+            const wsUrl = `ws://${ip}:1118`;
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                console.log('WebSocket 已连接');
+                status.textContent = '信令已连接，等待视频...';
+                createPeerConnection();
+            };
+
+            ws.onmessage = async (event) => {
+                const message = JSON.parse(event.data);
+                console.log('收到信令:', message.type);
+
+                if (message.type === 'offer') {
+                    await handleOffer(message);
+                } else if (message.type === 'ice') {
+                    await handleIceCandidate(message);
+                }
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket 错误:', error);
+                status.textContent = '连接错误';
+                status.className = 'error';
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket 已断开');
+                setTimeout(() => {
+                    if (signalingServerIP) {
+                        connectWebRTC(signalingServerIP);
+                    }
+                }, 3000);
+            };
+        }
+
+        function createPeerConnection() {
+            const config = {
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' }
+                ]
+            };
+
+            pc = new RTCPeerConnection(config);
+
+            pc.ontrack = (event) => {
+                console.log('收到媒体轨道:', event.track.kind);
+                if (event.track.kind === 'video') {
+                    video.srcObject = event.streams[0];
+                    video.play().catch(e => console.error('播放失败:', e));
+                    status.textContent = '正在播放';
+                    status.className = 'connected';
+
+                    // 3秒后隐藏状态
+                    setTimeout(() => {
+                        status.classList.add('hidden');
+                    }, 3000);
+                }
+            };
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: 'ice',
+                        candidate: event.candidate.candidate,
+                        sdpMid: event.candidate.sdpMid,
+                        sdpMLineIndex: event.candidate.sdpMLineIndex
+                    }));
+                }
+            };
+
+            pc.onconnectionstatechange = () => {
+                console.log('连接状态:', pc.connectionState);
+                if (pc.connectionState === 'connected') {
+                    status.textContent = '已连接';
+                    status.className = 'connected';
+                } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                    status.textContent = '连接断开';
+                    status.className = 'error';
+                    status.classList.remove('hidden');
+                }
+            };
+
+            console.log('PeerConnection 已创建');
+        }
+
+        async function handleOffer(message) {
+            if (!pc) createPeerConnection();
+
+            try {
+                const offer = new RTCSessionDescription({
+                    type: 'offer',
+                    sdp: message.sdp
+                });
+
+                await pc.setRemoteDescription(offer);
+                console.log('已设置远程 Offer');
+
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                console.log('已创建 Answer');
+
+                ws.send(JSON.stringify({
+                    type: 'answer',
+                    sdp: answer.sdp
+                }));
+            } catch (error) {
+                console.error('处理 Offer 失败:', error);
+                status.textContent = '连接失败: ' + error.message;
+                status.className = 'error';
+            }
+        }
+
+        async function handleIceCandidate(message) {
+            if (!pc) return;
+
+            try {
+                const candidate = new RTCIceCandidate({
+                    candidate: message.candidate,
+                    sdpMid: message.sdpMid,
+                    sdpMLineIndex: message.sdpMLineIndex
+                });
+                await pc.addIceCandidate(candidate);
+                console.log('已添加 ICE Candidate');
+            } catch (error) {
+                console.error('添加 ICE Candidate 失败:', error);
+            }
+        }
+
+        function closeWebRTC() {
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+            video.srcObject = null;
+            status.textContent = '已断开';
+            status.className = '';
+            status.classList.remove('hidden');
+        }
+    </script>
+</body>
+</html>
