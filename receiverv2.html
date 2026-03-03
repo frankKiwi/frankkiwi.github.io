@@ -168,32 +168,26 @@
                 const audioBuffer = audioContext.createBuffer(channels, frameCount, sampleRate);
                 // 显式按 little-endian 解析，避免不同运行时对 Int16Array 端序处理差异引入噪声。
                 const pcmDataView = new DataView(arrayBuffer, payloadOffset, frameCount * channels * 2);
-                const fadeSamples = Math.min(16, Math.floor(frameCount / 4));
                 for (let ch = 0; ch < channels; ch++) {
                     const channelData = audioBuffer.getChannelData(ch);
                     for (let i = 0; i < frameCount; i++) {
                         const sampleIndex = i * channels + ch;
                         const s16 = pcmDataView.getInt16(sampleIndex * 2, true);
-                        let v = s16 / 32768;
-                        // 对每个 chunk 做短淡入淡出，降低块边界爆音/刺啦声。
-                        if (fadeSamples > 0) {
-                            if (i < fadeSamples) v *= (i / fadeSamples);
-                            else if (i >= frameCount - fadeSamples) v *= ((frameCount - 1 - i) / fadeSamples);
-                        }
-                        channelData[i] = v;
+                        channelData[i] = s16 / 32768;
                     }
                 }
 
                 const source = audioContext.createBufferSource();
                 source.buffer = audioBuffer;
                 source.connect(audioGainNode);
-                // 维持稳定抖动缓冲，尽量避免频繁回退时间轴导致的噪声。
+                // 固定 10ms 时钟推进，减少包长抖动导致的刺啦声。
                 const now = audioContext.currentTime;
                 if (nextAudioTime < now + 0.08) nextAudioTime = now + 0.08;
                 if (nextAudioTime - now > 1.2) nextAudioTime = now + 0.15;
                 const startAt = nextAudioTime;
                 source.start(startAt);
-                nextAudioTime = startAt + audioBuffer.duration;
+                const packetDuration = (sampleRate === 48000 && frameCount === 480) ? 0.01 : (frameCount / sampleRate);
+                nextAudioTime = startAt + packetDuration;
                 audioPacketCount += 1;
                 if (audioPacketCount % 100 === 0) {
                     console.log('Audio packets played:', audioPacketCount, 'rate:', sampleRate, 'ch:', channels);
