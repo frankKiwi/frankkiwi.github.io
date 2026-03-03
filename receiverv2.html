@@ -47,7 +47,6 @@
         var heartbeatTimer = null;
         var audioContext = null;
         var audioGainNode = null;
-        var audioCompressor = null;
         var nextAudioTime = 0;
         var audioPacketCount = 0;
 
@@ -157,39 +156,41 @@
 
                 if (!audioContext) {
                     audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                    audioCompressor = audioContext.createDynamicsCompressor();
-                    audioCompressor.threshold.value = -18;
-                    audioCompressor.knee.value = 20;
-                    audioCompressor.ratio.value = 8;
-                    audioCompressor.attack.value = 0.003;
-                    audioCompressor.release.value = 0.2;
                     audioGainNode = audioContext.createGain();
-                    // 轻微增益，避免削波导致刺啦声
-                    audioGainNode.gain.value = 1.2;
-                    audioGainNode.connect(audioCompressor);
-                    audioCompressor.connect(audioContext.destination);
+                    audioGainNode.gain.value = 1.0;
+                    audioGainNode.connect(audioContext.destination);
                     nextAudioTime = audioContext.currentTime;
                 }
                 if (audioContext.state === 'suspended') {
                     await audioContext.resume();
                 }
 
-                const pcmView = new Int16Array(arrayBuffer, payloadOffset, frameCount * channels);
                 const audioBuffer = audioContext.createBuffer(channels, frameCount, sampleRate);
+                // 显式按 little-endian 解析，避免不同运行时对 Int16Array 端序处理差异引入噪声。
+                const pcmDataView = new DataView(arrayBuffer, payloadOffset, frameCount * channels * 2);
+                const fadeSamples = Math.min(16, Math.floor(frameCount / 4));
                 for (let ch = 0; ch < channels; ch++) {
                     const channelData = audioBuffer.getChannelData(ch);
                     for (let i = 0; i < frameCount; i++) {
-                        channelData[i] = pcmView[i * channels + ch] / 32768;
+                        const sampleIndex = i * channels + ch;
+                        const s16 = pcmDataView.getInt16(sampleIndex * 2, true);
+                        let v = s16 / 32768;
+                        // 对每个 chunk 做短淡入淡出，降低块边界爆音/刺啦声。
+                        if (fadeSamples > 0) {
+                            if (i < fadeSamples) v *= (i / fadeSamples);
+                            else if (i >= frameCount - fadeSamples) v *= ((frameCount - 1 - i) / fadeSamples);
+                        }
+                        channelData[i] = v;
                     }
                 }
 
                 const source = audioContext.createBufferSource();
                 source.buffer = audioBuffer;
                 source.connect(audioGainNode);
-                // 增加缓冲避免抖动造成“听不清/机械音”
+                // 维持稳定抖动缓冲，尽量避免频繁回退时间轴导致的噪声。
                 const now = audioContext.currentTime;
-                if (nextAudioTime < now) nextAudioTime = now + 0.12;
-                if (nextAudioTime - now > 0.8) nextAudioTime = now + 0.12;
+                if (nextAudioTime < now + 0.08) nextAudioTime = now + 0.08;
+                if (nextAudioTime - now > 1.2) nextAudioTime = now + 0.15;
                 const startAt = nextAudioTime;
                 source.start(startAt);
                 nextAudioTime = startAt + audioBuffer.duration;
