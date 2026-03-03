@@ -40,10 +40,14 @@
         const video = document.getElementById('video');
         const status = document.getElementById('status');
 
-        let pc = null;
-        let ws = null;
-        let signalingServerIP = null;
-        let signalingServerPort = 1118;
+        var pc = null;
+        var ws = null;
+        var signalingServerIP = null;
+        var signalingServerPort = 1118;
+        var heartbeatTimer = null;
+        var audioContext = null;
+        var nextAudioTime = 0;
+        var audioPacketCount = 0;
 
         // Cast Receiver 初始化
         const context = cast.framework.CastReceiverContext.getInstance();
@@ -88,15 +92,21 @@
             // 创建 WebSocket 连接到手机的信令服务器
             const wsUrl = `ws://${ip}:${port}`;
             ws = new WebSocket(wsUrl);
+            ws.binaryType = 'arraybuffer';
 
             ws.onopen = () => {
                 console.log('WebSocket connected');
                 status.textContent = 'Signaling connected, waiting for stream...';
                 createPeerConnection();
                 ws.send(JSON.stringify({ type: 'ready' }));
+                startHeartbeat();
             };
 
             ws.onmessage = async (event) => {
+                if (typeof event.data !== 'string') {
+                    await handleBinaryAudio(event.data);
+                    return;
+                }
                 const message = JSON.parse(event.data);
                 console.log('Signaling message:', message.type);
 
@@ -115,12 +125,80 @@
 
             ws.onclose = () => {
                 console.log('WebSocket disconnected');
+                stopHeartbeat();
                 setTimeout(() => {
                     if (signalingServerIP) {
                         connectWebRTC(signalingServerIP, signalingServerPort);
                     }
                 }, 3000);
             };
+        }
+
+        async function handleBinaryAudio(data) {
+            try {
+                const arrayBuffer = data instanceof ArrayBuffer ? data : await data.arrayBuffer();
+                if (arrayBuffer.byteLength < 14) return;
+                const view = new DataView(arrayBuffer);
+                const magic =
+                    String.fromCharCode(view.getUint8(0)) +
+                    String.fromCharCode(view.getUint8(1)) +
+                    String.fromCharCode(view.getUint8(2)) +
+                    String.fromCharCode(view.getUint8(3));
+                if (magic !== 'AUD0') return;
+
+                const sampleRate = view.getUint32(4, true);
+                const channels = view.getUint16(8, true);
+                const frameCount = view.getUint32(10, true);
+                const payloadOffset = 14;
+                const expectedBytes = frameCount * channels * 2;
+                if (arrayBuffer.byteLength < payloadOffset + expectedBytes) return;
+
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    nextAudioTime = audioContext.currentTime;
+                }
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+
+                const pcmView = new Int16Array(arrayBuffer, payloadOffset, frameCount * channels);
+                const audioBuffer = audioContext.createBuffer(channels, frameCount, sampleRate);
+                for (let ch = 0; ch < channels; ch++) {
+                    const channelData = audioBuffer.getChannelData(ch);
+                    for (let i = 0; i < frameCount; i++) {
+                        channelData[i] = pcmView[i * channels + ch] / 32768;
+                    }
+                }
+
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioContext.destination);
+                const startAt = Math.max(audioContext.currentTime + 0.03, nextAudioTime);
+                source.start(startAt);
+                nextAudioTime = startAt + audioBuffer.duration;
+                audioPacketCount += 1;
+                if (audioPacketCount % 100 === 0) {
+                    console.log('Audio packets played:', audioPacketCount, 'rate:', sampleRate, 'ch:', channels);
+                }
+            } catch (error) {
+                console.error('Audio chunk handling failed:', error);
+            }
+        }
+
+        function startHeartbeat() {
+            stopHeartbeat();
+            heartbeatTimer = setInterval(() => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+                }
+            }, 10000);
+        }
+
+        function stopHeartbeat() {
+            if (heartbeatTimer) {
+                clearInterval(heartbeatTimer);
+                heartbeatTimer = null;
+            }
         }
 
         function createPeerConnection() {
@@ -140,6 +218,8 @@
                 }
 
                 if (event.track.kind === 'video') {
+                    // 先保证视频自动播放稳定，音频走独立 AudioContext 通道
+                    video.muted = true;
                     video.play().catch(e => console.error('Playback failed:', e));
                     status.textContent = 'Playing';
                     status.className = 'connected';
@@ -220,6 +300,7 @@
 
         function closeWebRTC() {
             if (ws) {
+                stopHeartbeat();
                 ws.close();
                 ws = null;
             }
@@ -228,6 +309,11 @@
                 pc = null;
             }
             video.srcObject = null;
+            if (audioContext) {
+                audioContext.close().catch(() => {});
+                audioContext = null;
+            }
+            nextAudioTime = 0;
             status.textContent = 'Disconnected';
             status.className = '';
             status.classList.remove('hidden');
