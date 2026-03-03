@@ -30,7 +30,7 @@
     </style>
 </head>
 <body>
-    <video id="video" autoplay playsinline muted></video>
+    <video id="video" autoplay playsinline></video>
     <div id="status">等待连接...</div>
 
     <!-- Google Cast Receiver SDK -->
@@ -133,8 +133,11 @@
 
             pc.ontrack = (event) => {
                 console.log('收到媒体轨道:', event.track.kind);
-                if (event.track.kind === 'video') {
+                if (event.streams && event.streams[0] && video.srcObject !== event.streams[0]) {
                     video.srcObject = event.streams[0];
+                }
+
+                if (event.track.kind === 'video') {
                     video.play().catch(e => console.error('播放失败:', e));
                     status.textContent = '正在播放';
                     status.className = 'connected';
