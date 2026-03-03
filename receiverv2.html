@@ -46,6 +46,7 @@
         var signalingServerPort = 1118;
         var heartbeatTimer = null;
         var audioContext = null;
+        var audioGainNode = null;
         var nextAudioTime = 0;
         var audioPacketCount = 0;
 
@@ -155,6 +156,10 @@
 
                 if (!audioContext) {
                     audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    audioGainNode = audioContext.createGain();
+                    // 适度放大，解决“有声音但很难听清”
+                    audioGainNode.gain.value = 3.0;
+                    audioGainNode.connect(audioContext.destination);
                     nextAudioTime = audioContext.currentTime;
                 }
                 if (audioContext.state === 'suspended') {
@@ -172,8 +177,12 @@
 
                 const source = audioContext.createBufferSource();
                 source.buffer = audioBuffer;
-                source.connect(audioContext.destination);
-                const startAt = Math.max(audioContext.currentTime + 0.03, nextAudioTime);
+                source.connect(audioGainNode);
+                // 增加缓冲避免抖动造成“听不清/机械音”
+                const now = audioContext.currentTime;
+                if (nextAudioTime < now) nextAudioTime = now + 0.12;
+                if (nextAudioTime - now > 0.8) nextAudioTime = now + 0.12;
+                const startAt = nextAudioTime;
                 source.start(startAt);
                 nextAudioTime = startAt + audioBuffer.duration;
                 audioPacketCount += 1;
