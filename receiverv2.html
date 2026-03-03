@@ -182,11 +182,11 @@
                 source.connect(audioGainNode);
                 // 固定 10ms 时钟推进，减少包长抖动导致的刺啦声。
                 const now = audioContext.currentTime;
-                if (nextAudioTime < now + 0.08) nextAudioTime = now + 0.08;
-                if (nextAudioTime - now > 1.2) nextAudioTime = now + 0.15;
+                if (nextAudioTime < now + 0.15) nextAudioTime = now + 0.15;
+                if (nextAudioTime - now > 1.5) nextAudioTime = now + 0.2;
                 const startAt = nextAudioTime;
                 source.start(startAt);
-                const packetDuration = (sampleRate === 48000 && frameCount === 480) ? 0.01 : (frameCount / sampleRate);
+                const packetDuration = (sampleRate === 48000 && frameCount === 960) ? 0.02 : (frameCount / sampleRate);
                 nextAudioTime = startAt + packetDuration;
                 audioPacketCount += 1;
                 if (audioPacketCount % 100 === 0) {
