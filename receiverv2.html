@@ -47,6 +47,7 @@
         var heartbeatTimer = null;
         var audioContext = null;
         var audioGainNode = null;
+        var audioCompressor = null;
         var nextAudioTime = 0;
         var audioPacketCount = 0;
 
@@ -156,10 +157,17 @@
 
                 if (!audioContext) {
                     audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    audioCompressor = audioContext.createDynamicsCompressor();
+                    audioCompressor.threshold.value = -18;
+                    audioCompressor.knee.value = 20;
+                    audioCompressor.ratio.value = 8;
+                    audioCompressor.attack.value = 0.003;
+                    audioCompressor.release.value = 0.2;
                     audioGainNode = audioContext.createGain();
-                    // 适度放大，解决“有声音但很难听清”
-                    audioGainNode.gain.value = 3.0;
-                    audioGainNode.connect(audioContext.destination);
+                    // 轻微增益，避免削波导致刺啦声
+                    audioGainNode.gain.value = 1.2;
+                    audioGainNode.connect(audioCompressor);
+                    audioCompressor.connect(audioContext.destination);
                     nextAudioTime = audioContext.currentTime;
                 }
                 if (audioContext.state === 'suspended') {
