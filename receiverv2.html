@@ -107,7 +107,7 @@
 
             ws.onmessage = async (event) => {
                 if (typeof event.data !== 'string') {
-                    await handleBinaryAudio(event.data);
+                    // Video-only mode: ignore binary audio payloads.
                     return;
                 }
                 const message = JSON.parse(event.data);
