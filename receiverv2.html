@@ -46,8 +46,10 @@
         var signalingServerPort = 1118;
         var heartbeatTimer = null;
         var audioContext = null;
+        var audioNode = null;
         var audioGainNode = null;
-        var nextAudioTime = 0;
+        var audioWorkletReady = false;
+        var pendingAudioChunks = [];
         var audioPacketCount = 0;
 
         // Cast Receiver 初始化
@@ -135,6 +137,120 @@
             };
         }
 
+        async function ensureAudioPipeline() {
+            if (audioWorkletReady && audioContext) {
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+                return;
+            }
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    latencyHint: 'interactive',
+                    sampleRate: 48000
+                });
+            }
+
+            const workletCode = `
+                class MirrorAudioProcessor extends AudioWorkletProcessor {
+                    constructor() {
+                        super();
+                        this.capacity = 48000 * 6;
+                        this.buffer = new Float32Array(this.capacity);
+                        this.readIndex = 0;
+                        this.writeIndex = 0;
+                        this.count = 0;
+                        this.started = false;
+                        this.startThreshold = 4800;
+                        this.underruns = 0;
+                        this.port.onmessage = (event) => {
+                            const msg = event.data || {};
+                            if (msg.type === 'config' && Number.isFinite(msg.startThreshold)) {
+                                this.startThreshold = Math.max(256, msg.startThreshold | 0);
+                                return;
+                            }
+                            if (msg.type !== 'push' || !(msg.samples instanceof ArrayBuffer)) return;
+                            const samples = new Float32Array(msg.samples);
+                            const incoming = samples.length;
+                            if (incoming <= 0) return;
+                            let free = this.capacity - this.count;
+                            if (incoming > free) {
+                                const drop = incoming - free;
+                                this.readIndex = (this.readIndex + drop) % this.capacity;
+                                this.count -= drop;
+                            }
+                            for (let i = 0; i < incoming; i++) {
+                                this.buffer[this.writeIndex] = samples[i];
+                                this.writeIndex = (this.writeIndex + 1) % this.capacity;
+                            }
+                            this.count += incoming;
+                            if (!this.started && this.count >= this.startThreshold) {
+                                this.started = true;
+                            }
+                        };
+                    }
+
+                    process(inputs, outputs) {
+                        const output = outputs[0][0];
+                        const frames = output.length;
+                        if (!this.started) {
+                            output.fill(0);
+                            return true;
+                        }
+                        for (let i = 0; i < frames; i++) {
+                            if (this.count > 0) {
+                                output[i] = this.buffer[this.readIndex];
+                                this.readIndex = (this.readIndex + 1) % this.capacity;
+                                this.count--;
+                            } else {
+                                output[i] = 0;
+                                this.underruns++;
+                            }
+                        }
+                        if (this.underruns > 0 && this.underruns % 2000 === 0) {
+                            this.port.postMessage({ type: 'underrun', count: this.underruns });
+                        }
+                        return true;
+                    }
+                }
+                registerProcessor('mirror-audio-processor', MirrorAudioProcessor);
+            `;
+
+            const blob = new Blob([workletCode], { type: 'application/javascript' });
+            const moduleURL = URL.createObjectURL(blob);
+            await audioContext.audioWorklet.addModule(moduleURL);
+            URL.revokeObjectURL(moduleURL);
+
+            audioNode = new AudioWorkletNode(audioContext, 'mirror-audio-processor', {
+                numberOfInputs: 0,
+                numberOfOutputs: 1,
+                outputChannelCount: [1]
+            });
+            audioNode.port.onmessage = (event) => {
+                if (event.data && event.data.type === 'underrun') {
+                    console.warn('Audio underrun count:', event.data.count);
+                }
+            };
+            audioNode.port.postMessage({ type: 'config', startThreshold: 9600 });
+
+            audioGainNode = audioContext.createGain();
+            audioGainNode.gain.value = 1.0;
+            audioNode.connect(audioGainNode);
+            audioGainNode.connect(audioContext.destination);
+
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+            audioWorkletReady = true;
+
+            if (pendingAudioChunks.length > 0) {
+                pendingAudioChunks.forEach((chunk) => {
+                    audioNode.port.postMessage({ type: 'push', samples: chunk }, [chunk]);
+                });
+                pendingAudioChunks = [];
+            }
+        }
+
         async function handleBinaryAudio(data) {
             try {
                 const arrayBuffer = data instanceof ArrayBuffer ? data : await data.arrayBuffer();
@@ -153,41 +269,24 @@
                 const payloadOffset = 14;
                 const expectedBytes = frameCount * channels * 2;
                 if (arrayBuffer.byteLength < payloadOffset + expectedBytes) return;
-
-                if (!audioContext) {
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                    audioGainNode = audioContext.createGain();
-                    audioGainNode.gain.value = 1.0;
-                    audioGainNode.connect(audioContext.destination);
-                    nextAudioTime = audioContext.currentTime;
-                }
-                if (audioContext.state === 'suspended') {
-                    await audioContext.resume();
-                }
-
-                const audioBuffer = audioContext.createBuffer(channels, frameCount, sampleRate);
-                // 显式按 little-endian 解析，避免不同运行时对 Int16Array 端序处理差异引入噪声。
                 const pcmDataView = new DataView(arrayBuffer, payloadOffset, frameCount * channels * 2);
-                for (let ch = 0; ch < channels; ch++) {
-                    const channelData = audioBuffer.getChannelData(ch);
-                    for (let i = 0; i < frameCount; i++) {
+                const monoSamples = new Float32Array(frameCount);
+                for (let i = 0; i < frameCount; i++) {
+                    let mixed = 0;
+                    for (let ch = 0; ch < channels; ch++) {
                         const sampleIndex = i * channels + ch;
-                        const s16 = pcmDataView.getInt16(sampleIndex * 2, true);
-                        channelData[i] = s16 / 32768;
+                        mixed += pcmDataView.getInt16(sampleIndex * 2, true) / 32768;
                     }
+                    monoSamples[i] = mixed / Math.max(1, channels);
                 }
 
-                const source = audioContext.createBufferSource();
-                source.buffer = audioBuffer;
-                source.connect(audioGainNode);
-                // 固定 10ms 时钟推进，减少包长抖动导致的刺啦声。
-                const now = audioContext.currentTime;
-                if (nextAudioTime < now + 0.15) nextAudioTime = now + 0.15;
-                if (nextAudioTime - now > 1.5) nextAudioTime = now + 0.2;
-                const startAt = nextAudioTime;
-                source.start(startAt);
-                const packetDuration = (sampleRate === 48000 && frameCount === 960) ? 0.02 : (frameCount / sampleRate);
-                nextAudioTime = startAt + packetDuration;
+                await ensureAudioPipeline();
+                const chunk = monoSamples.buffer;
+                if (audioWorkletReady && audioNode) {
+                    audioNode.port.postMessage({ type: 'push', samples: chunk }, [chunk]);
+                } else {
+                    pendingAudioChunks.push(chunk);
+                }
                 audioPacketCount += 1;
                 if (audioPacketCount % 100 === 0) {
                     console.log('Audio packets played:', audioPacketCount, 'rate:', sampleRate, 'ch:', channels);
@@ -325,7 +424,10 @@
                 audioContext.close().catch(() => {});
                 audioContext = null;
             }
-            nextAudioTime = 0;
+            audioNode = null;
+            audioGainNode = null;
+            audioWorkletReady = false;
+            pendingAudioChunks = [];
             status.textContent = 'Disconnected';
             status.className = '';
             status.classList.remove('hidden');
