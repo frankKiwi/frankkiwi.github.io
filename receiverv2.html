@@ -6,11 +6,22 @@
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { background: #000; overflow: hidden; }
+        #cover {
+            position: fixed;
+            inset: 0;
+            width: 100vw;
+            height: 100vh;
+            object-fit: contain; /* 按图片比例完整展示，不裁切铺满 */
+            background: #000;
+            z-index: 10;
+        }
         #video {
             width: 100vw;
             height: 100vh;
             object-fit: contain;
             background: #000;
+            position: relative;
+            z-index: 1;
         }
         #status {
             position: fixed;
@@ -30,6 +41,7 @@
     </style>
 </head>
 <body>
+    <img id="cover" class="hidden" alt="Cover" />
     <video id="video" autoplay playsinline></video>
     <div id="status">Waiting for connection...</div>
 
@@ -38,6 +50,7 @@
 
     <script>
         const video = document.getElementById('video');
+        const cover = document.getElementById('cover');
         const status = document.getElementById('status');
 
         var pc = null;
@@ -45,16 +58,22 @@
         var signalingServerIP = null;
         var signalingServerPort = 1118;
         var heartbeatTimer = null;
-        var audioContext = null;
-        var audioNode = null;
-        var audioGainNode = null;
-        var audioWorkletReady = false;
-        var pendingAudioChunks = [];
-        var audioPacketCount = 0;
+
+        // 固定封面图：把图片放到 CastReceiver 目录下，例如 CastReceiver/cover.jpg
+        // 你也可以换成 https 的 CDN 地址（更推荐）
+        const FIXED_COVER_URL = './cover.png';
+
+        function showCover() {
+            if (cover.src !== FIXED_COVER_URL) cover.src = FIXED_COVER_URL;
+            cover.classList.remove('hidden');
+        }
+
+        function hideCover() {
+            cover.classList.add('hidden');
+        }
 
         // Cast Receiver 初始化
         const context = cast.framework.CastReceiverContext.getInstance();
-        const playerManager = context.getPlayerManager();
 
         // 监听自定义消息（从手机 App 发送的信令服务器 IP）
         const CUSTOM_CHANNEL = 'urn:x-cast:com.screenmirror.webrtc';
@@ -75,11 +94,31 @@
                 signalingServerIP = data.signalingIP;
                 signalingServerPort = Number(data.signalingPort || 1118);
                 status.textContent = 'Connecting WebRTC...';
+                // 设备端已开始会话：先展示固定封面（流没来之前用作占位）
+                showCover();
                 connectWebRTC(signalingServerIP, signalingServerPort);
             } else if (data.type === 'stop') {
                 closeWebRTC();
             }
         });
+
+        // Sender 连接/断开时机：连接成功先展示封面
+        try {
+            context.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, () => {
+                status.textContent = 'Device connected';
+                status.className = 'connected';
+                status.classList.remove('hidden');
+                showCover();
+            });
+            context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, () => {
+                status.textContent = 'Waiting for connection...';
+                status.className = '';
+                status.classList.remove('hidden');
+                hideCover();
+            });
+        } catch (e) {
+            console.warn('Cast sender event listener setup failed:', e);
+        }
 
         // 启动 Cast Receiver
         const options = new cast.framework.CastReceiverOptions();
@@ -88,11 +127,9 @@
 
         console.log('Cast Receiver started');
 
-        // WebRTC 连接
         function connectWebRTC(ip, port) {
             console.log('Connecting signaling server:', ip, port);
 
-            // 创建 WebSocket 连接到手机的信令服务器
             const wsUrl = `ws://${ip}:${port}`;
             ws = new WebSocket(wsUrl);
             ws.binaryType = 'arraybuffer';
@@ -100,16 +137,14 @@
             ws.onopen = () => {
                 console.log('WebSocket connected');
                 status.textContent = 'Signaling connected, waiting for stream...';
+                showCover();
                 createPeerConnection();
                 ws.send(JSON.stringify({ type: 'ready' }));
                 startHeartbeat();
             };
 
             ws.onmessage = async (event) => {
-                if (typeof event.data !== 'string') {
-                    // Video-only mode: ignore binary audio payloads.
-                    return;
-                }
+                if (typeof event.data !== 'string') return;
                 const message = JSON.parse(event.data);
                 console.log('Signaling message:', message.type);
 
@@ -135,165 +170,6 @@
                     }
                 }, 3000);
             };
-        }
-
-        async function ensureAudioPipeline() {
-            if (audioWorkletReady && audioContext) {
-                if (audioContext.state === 'suspended') {
-                    await audioContext.resume();
-                }
-                return;
-            }
-            if (!audioContext) {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                    latencyHint: 'interactive',
-                    sampleRate: 48000
-                });
-            }
-
-            const workletCode = `
-                class MirrorAudioProcessor extends AudioWorkletProcessor {
-                    constructor() {
-                        super();
-                        this.capacity = 48000 * 6;
-                        this.buffer = new Float32Array(this.capacity);
-                        this.readIndex = 0;
-                        this.writeIndex = 0;
-                        this.count = 0;
-                        this.started = false;
-                        this.startThreshold = 4800;
-                        this.underruns = 0;
-                        this.port.onmessage = (event) => {
-                            const msg = event.data || {};
-                            if (msg.type === 'config' && Number.isFinite(msg.startThreshold)) {
-                                this.startThreshold = Math.max(256, msg.startThreshold | 0);
-                                return;
-                            }
-                            if (msg.type !== 'push' || !(msg.samples instanceof ArrayBuffer)) return;
-                            const samples = new Float32Array(msg.samples);
-                            const incoming = samples.length;
-                            if (incoming <= 0) return;
-                            let free = this.capacity - this.count;
-                            if (incoming > free) {
-                                const drop = incoming - free;
-                                this.readIndex = (this.readIndex + drop) % this.capacity;
-                                this.count -= drop;
-                            }
-                            for (let i = 0; i < incoming; i++) {
-                                this.buffer[this.writeIndex] = samples[i];
-                                this.writeIndex = (this.writeIndex + 1) % this.capacity;
-                            }
-                            this.count += incoming;
-                            if (!this.started && this.count >= this.startThreshold) {
-                                this.started = true;
-                            }
-                        };
-                    }
-
-                    process(inputs, outputs) {
-                        const output = outputs[0][0];
-                        const frames = output.length;
-                        if (!this.started) {
-                            output.fill(0);
-                            return true;
-                        }
-                        for (let i = 0; i < frames; i++) {
-                            if (this.count > 0) {
-                                output[i] = this.buffer[this.readIndex];
-                                this.readIndex = (this.readIndex + 1) % this.capacity;
-                                this.count--;
-                            } else {
-                                output[i] = 0;
-                                this.underruns++;
-                            }
-                        }
-                        if (this.underruns > 0 && this.underruns % 2000 === 0) {
-                            this.port.postMessage({ type: 'underrun', count: this.underruns });
-                        }
-                        return true;
-                    }
-                }
-                registerProcessor('mirror-audio-processor', MirrorAudioProcessor);
-            `;
-
-            const blob = new Blob([workletCode], { type: 'application/javascript' });
-            const moduleURL = URL.createObjectURL(blob);
-            await audioContext.audioWorklet.addModule(moduleURL);
-            URL.revokeObjectURL(moduleURL);
-
-            audioNode = new AudioWorkletNode(audioContext, 'mirror-audio-processor', {
-                numberOfInputs: 0,
-                numberOfOutputs: 1,
-                outputChannelCount: [1]
-            });
-            audioNode.port.onmessage = (event) => {
-                if (event.data && event.data.type === 'underrun') {
-                    console.warn('Audio underrun count:', event.data.count);
-                }
-            };
-            audioNode.port.postMessage({ type: 'config', startThreshold: 9600 });
-
-            audioGainNode = audioContext.createGain();
-            audioGainNode.gain.value = 1.0;
-            audioNode.connect(audioGainNode);
-            audioGainNode.connect(audioContext.destination);
-
-            if (audioContext.state === 'suspended') {
-                await audioContext.resume();
-            }
-            audioWorkletReady = true;
-
-            if (pendingAudioChunks.length > 0) {
-                pendingAudioChunks.forEach((chunk) => {
-                    audioNode.port.postMessage({ type: 'push', samples: chunk }, [chunk]);
-                });
-                pendingAudioChunks = [];
-            }
-        }
-
-        async function handleBinaryAudio(data) {
-            try {
-                const arrayBuffer = data instanceof ArrayBuffer ? data : await data.arrayBuffer();
-                if (arrayBuffer.byteLength < 14) return;
-                const view = new DataView(arrayBuffer);
-                const magic =
-                    String.fromCharCode(view.getUint8(0)) +
-                    String.fromCharCode(view.getUint8(1)) +
-                    String.fromCharCode(view.getUint8(2)) +
-                    String.fromCharCode(view.getUint8(3));
-                if (magic !== 'AUD0') return;
-
-                const sampleRate = view.getUint32(4, true);
-                const channels = view.getUint16(8, true);
-                const frameCount = view.getUint32(10, true);
-                const payloadOffset = 14;
-                const expectedBytes = frameCount * channels * 2;
-                if (arrayBuffer.byteLength < payloadOffset + expectedBytes) return;
-                const pcmDataView = new DataView(arrayBuffer, payloadOffset, frameCount * channels * 2);
-                const monoSamples = new Float32Array(frameCount);
-                for (let i = 0; i < frameCount; i++) {
-                    let mixed = 0;
-                    for (let ch = 0; ch < channels; ch++) {
-                        const sampleIndex = i * channels + ch;
-                        mixed += pcmDataView.getInt16(sampleIndex * 2, true) / 32768;
-                    }
-                    monoSamples[i] = mixed / Math.max(1, channels);
-                }
-
-                await ensureAudioPipeline();
-                const chunk = monoSamples.buffer;
-                if (audioWorkletReady && audioNode) {
-                    audioNode.port.postMessage({ type: 'push', samples: chunk }, [chunk]);
-                } else {
-                    pendingAudioChunks.push(chunk);
-                }
-                audioPacketCount += 1;
-                if (audioPacketCount % 100 === 0) {
-                    console.log('Audio packets played:', audioPacketCount, 'rate:', sampleRate, 'ch:', channels);
-                }
-            } catch (error) {
-                console.error('Audio chunk handling failed:', error);
-            }
         }
 
         function startHeartbeat() {
@@ -329,13 +205,13 @@
                 }
 
                 if (event.track.kind === 'video') {
-                    // 先保证视频自动播放稳定，音频走独立 AudioContext 通道
                     video.muted = true;
                     video.play().catch(e => console.error('Playback failed:', e));
+                    // 流开始播放后隐藏封面
+                    hideCover();
                     status.textContent = 'Playing';
                     status.className = 'connected';
 
-                    // 3秒后隐藏状态
                     setTimeout(() => {
                         status.classList.add('hidden');
                     }, 3000);
@@ -360,10 +236,12 @@
                 if (pc.connectionState === 'connected') {
                     status.textContent = 'Connected';
                     status.className = 'connected';
+                    showCover();
                 } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
                     status.textContent = 'Disconnected';
                     status.className = 'error';
                     status.classList.remove('hidden');
+                    showCover();
                 }
             };
 
@@ -420,18 +298,13 @@
                 pc = null;
             }
             video.srcObject = null;
-            if (audioContext) {
-                audioContext.close().catch(() => {});
-                audioContext = null;
-            }
-            audioNode = null;
-            audioGainNode = null;
-            audioWorkletReady = false;
-            pendingAudioChunks = [];
+
             status.textContent = 'Disconnected';
             status.className = '';
             status.classList.remove('hidden');
+            showCover();
         }
     </script>
 </body>
 </html>
+
