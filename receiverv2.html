@@ -43,7 +43,7 @@
 <body>
     <img id="cover" class="hidden" alt="Cover" />
     <video id="video" autoplay playsinline></video>
-    <div id="status">Waiting for connection...</div>
+    <div id="status"></div>
 
     <!-- Google Cast Receiver SDK -->
     <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
@@ -58,9 +58,15 @@
         var signalingServerIP = null;
         var signalingServerPort = 1118;
         var heartbeatTimer = null;
+        var audioContext = null;
+        var audioNode = null;
+        var audioGainNode = null;
+        var audioWorkletReady = false;
+        var pendingAudioChunks = [];
+        var audioPacketCount = 0;
 
-        // 固定封面图：把图片放到 CastReceiver 目录下，例如 CastReceiver/cover.jpg
-        // 你也可以换成 https 的 CDN 地址（更推荐）
+        // 固定封面路径：请在 CastReceiver 目录放一张 cover.jpg
+        // 也可以改成 https 的完整 URL
         const FIXED_COVER_URL = './cover.png';
 
         function showCover() {
@@ -93,7 +99,7 @@
             if (data.type === 'start' && data.signalingIP) {
                 signalingServerIP = data.signalingIP;
                 signalingServerPort = Number(data.signalingPort || 1118);
-                status.textContent = 'Connecting WebRTC...';
+                // status.textContent = 'Connecting WebRTC...';
                 // 设备端已开始会话：先展示固定封面（流没来之前用作占位）
                 showCover();
                 connectWebRTC(signalingServerIP, signalingServerPort);
@@ -105,13 +111,13 @@
         // Sender 连接/断开时机：连接成功先展示封面
         try {
             context.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, () => {
-                status.textContent = 'Device connected';
+                // status.textContent = 'Device connected';
                 status.className = 'connected';
                 status.classList.remove('hidden');
                 showCover();
             });
             context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, () => {
-                status.textContent = 'Waiting for connection...';
+                // status.textContent = 'Waiting for connection...';
                 status.className = '';
                 status.classList.remove('hidden');
                 hideCover();
@@ -127,16 +133,18 @@
 
         console.log('Cast Receiver started');
 
+        // WebRTC 连接
         function connectWebRTC(ip, port) {
             console.log('Connecting signaling server:', ip, port);
 
+            // 创建 WebSocket 连接到手机的信令服务器
             const wsUrl = `ws://${ip}:${port}`;
             ws = new WebSocket(wsUrl);
             ws.binaryType = 'arraybuffer';
 
             ws.onopen = () => {
                 console.log('WebSocket connected');
-                status.textContent = 'Signaling connected, waiting for stream...';
+                // status.textContent = 'Signaling connected, waiting for stream...';
                 showCover();
                 createPeerConnection();
                 ws.send(JSON.stringify({ type: 'ready' }));
@@ -144,7 +152,9 @@
             };
 
             ws.onmessage = async (event) => {
-                if (typeof event.data !== 'string') return;
+                if (typeof event.data !== 'string') {
+                    return;
+                }
                 const message = JSON.parse(event.data);
                 console.log('Signaling message:', message.type);
 
@@ -157,7 +167,7 @@
 
             ws.onerror = (error) => {
                 console.error('WebSocket error:', error);
-                status.textContent = 'Connection error';
+                // status.textContent = 'Connection error';
                 status.className = 'error';
             };
 
@@ -209,7 +219,7 @@
                     video.play().catch(e => console.error('Playback failed:', e));
                     // 流开始播放后隐藏封面
                     hideCover();
-                    status.textContent = 'Playing';
+                    // status.textContent = 'Playing';
                     status.className = 'connected';
 
                     setTimeout(() => {
@@ -234,13 +244,12 @@
             pc.onconnectionstatechange = () => {
                 console.log('Connection state:', pc.connectionState);
                 if (pc.connectionState === 'connected') {
-                    status.textContent = 'Connected';
                     status.className = 'connected';
-                    showCover();
                 } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-                    status.textContent = 'Disconnected';
+                    // status.textContent = 'Disconnected';
                     status.className = 'error';
                     status.classList.remove('hidden');
+                    // 断开或失败时重新显示封面
                     showCover();
                 }
             };
@@ -270,7 +279,7 @@
                 }));
             } catch (error) {
                 console.error('Failed to handle offer:', error);
-                status.textContent = 'Connection failed: ' + error.message;
+                // status.textContent = 'Connection failed: ' + error.message;
                 status.className = 'error';
             }
         }
@@ -299,7 +308,15 @@
             }
             video.srcObject = null;
 
-            status.textContent = 'Disconnected';
+            if (audioContext) {
+                audioContext.close().catch(() => {});
+                audioContext = null;
+            }
+            audioNode = null;
+            audioGainNode = null;
+            audioWorkletReady = false;
+            pendingAudioChunks = [];
+            // status.textContent = 'Disconnected';
             status.className = '';
             status.classList.remove('hidden');
             showCover();
