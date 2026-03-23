@@ -49,8 +49,39 @@
         var audioNode = null;
         var audioGainNode = null;
         var audioWorkletReady = false;
+        var audioPlaybackReady = false;
+        var audioUseScriptProcessor = false;
+        var scriptNode = null;
         var pendingAudioChunks = [];
         var audioPacketCount = 0;
+        var ringCap = 48000 * 6;
+        var ringBuf = new Float32Array(ringCap);
+        var ringRead = 0, ringWrite = 0, ringCount = 0;
+        var ringStarted = false;
+        var ringStartThreshold = 9600;
+
+        function resetAudioRing() {
+            ringRead = ringWrite = ringCount = 0;
+            ringStarted = false;
+            ringBuf.fill(0);
+        }
+
+        function pushAudioToRing(float32) {
+            const incoming = float32.length;
+            if (incoming <= 0) return;
+            let free = ringCap - ringCount;
+            if (incoming > free) {
+                const drop = incoming - free;
+                ringRead = (ringRead + drop) % ringCap;
+                ringCount -= drop;
+            }
+            for (let i = 0; i < incoming; i++) {
+                ringBuf[ringWrite] = float32[i];
+                ringWrite = (ringWrite + 1) % ringCap;
+            }
+            ringCount += incoming;
+            if (!ringStarted && ringCount >= ringStartThreshold) ringStarted = true;
+        }
 
         // Cast Receiver 初始化
         const context = cast.framework.CastReceiverContext.getInstance();
@@ -138,7 +169,7 @@
         }
 
         async function ensureAudioPipeline() {
-            if (audioWorkletReady && audioContext) {
+            if (audioPlaybackReady && audioContext) {
                 if (audioContext.state === 'suspended') {
                     await audioContext.resume();
                 }
@@ -151,7 +182,9 @@
                 });
             }
 
-            const workletCode = `
+            if (!audioUseScriptProcessor) {
+                try {
+                    const workletCode = `
                 class MirrorAudioProcessor extends AudioWorkletProcessor {
                     constructor() {
                         super();
@@ -216,36 +249,86 @@
                 registerProcessor('mirror-audio-processor', MirrorAudioProcessor);
             `;
 
-            const blob = new Blob([workletCode], { type: 'application/javascript' });
-            const moduleURL = URL.createObjectURL(blob);
-            await audioContext.audioWorklet.addModule(moduleURL);
-            URL.revokeObjectURL(moduleURL);
+                    const blob = new Blob([workletCode], { type: 'application/javascript' });
+                    const moduleURL = URL.createObjectURL(blob);
+                    await audioContext.audioWorklet.addModule(moduleURL);
+                    URL.revokeObjectURL(moduleURL);
 
-            audioNode = new AudioWorkletNode(audioContext, 'mirror-audio-processor', {
-                numberOfInputs: 0,
-                numberOfOutputs: 1,
-                outputChannelCount: [1]
-            });
-            audioNode.port.onmessage = (event) => {
-                if (event.data && event.data.type === 'underrun') {
-                    console.warn('Audio underrun count:', event.data.count);
+                    audioNode = new AudioWorkletNode(audioContext, 'mirror-audio-processor', {
+                        numberOfInputs: 0,
+                        numberOfOutputs: 1,
+                        outputChannelCount: [1]
+                    });
+                    audioNode.port.onmessage = (event) => {
+                        if (event.data && event.data.type === 'underrun') {
+                            console.warn('Audio underrun count:', event.data.count);
+                        }
+                    };
+                    audioNode.port.postMessage({ type: 'config', startThreshold: 9600 });
+
+                    audioGainNode = audioContext.createGain();
+                    audioGainNode.gain.value = 1.0;
+                    audioNode.connect(audioGainNode);
+                    audioGainNode.connect(audioContext.destination);
+
+                    if (audioContext.state === 'suspended') {
+                        await audioContext.resume();
+                    }
+                    audioWorkletReady = true;
+                    audioPlaybackReady = true;
+
+                    if (pendingAudioChunks.length > 0) {
+                        pendingAudioChunks.forEach((chunk) => {
+                            audioNode.port.postMessage({ type: 'push', samples: chunk }, [chunk]);
+                        });
+                        pendingAudioChunks = [];
+                    }
+                    return;
+                } catch (err) {
+                    console.warn('AudioWorklet unavailable, ScriptProcessor fallback', err);
+                    audioUseScriptProcessor = true;
+                    audioWorkletReady = false;
+                    if (audioNode) {
+                        try { audioNode.disconnect(); } catch (e) {}
+                        audioNode = null;
+                    }
                 }
-            };
-            audioNode.port.postMessage({ type: 'config', startThreshold: 9600 });
+            }
 
-            audioGainNode = audioContext.createGain();
-            audioGainNode.gain.value = 1.0;
-            audioNode.connect(audioGainNode);
-            audioGainNode.connect(audioContext.destination);
-
+            if (!audioGainNode) {
+                audioGainNode = audioContext.createGain();
+                audioGainNode.gain.value = 1.0;
+                audioGainNode.connect(audioContext.destination);
+            }
+            if (!scriptNode) {
+                scriptNode = audioContext.createScriptProcessor(2048, 0, 1);
+                scriptNode.onaudioprocess = (e) => {
+                    const out = e.outputBuffer.getChannelData(0);
+                    const n = out.length;
+                    if (!ringStarted) {
+                        out.fill(0);
+                        return;
+                    }
+                    for (let i = 0; i < n; i++) {
+                        if (ringCount > 0) {
+                            out[i] = ringBuf[ringRead];
+                            ringRead = (ringRead + 1) % ringCap;
+                            ringCount--;
+                        } else {
+                            out[i] = 0;
+                        }
+                    }
+                };
+                scriptNode.connect(audioGainNode);
+            }
             if (audioContext.state === 'suspended') {
                 await audioContext.resume();
             }
-            audioWorkletReady = true;
+            audioPlaybackReady = true;
 
             if (pendingAudioChunks.length > 0) {
                 pendingAudioChunks.forEach((chunk) => {
-                    audioNode.port.postMessage({ type: 'push', samples: chunk }, [chunk]);
+                    pushAudioToRing(new Float32Array(chunk));
                 });
                 pendingAudioChunks = [];
             }
@@ -281,11 +364,13 @@
                 }
 
                 await ensureAudioPipeline();
-                const chunk = monoSamples.buffer;
-                if (audioWorkletReady && audioNode) {
+                if (audioUseScriptProcessor) {
+                    pushAudioToRing(monoSamples);
+                } else if (audioWorkletReady && audioNode) {
+                    const chunk = monoSamples.buffer;
                     audioNode.port.postMessage({ type: 'push', samples: chunk }, [chunk]);
                 } else {
-                    pendingAudioChunks.push(chunk);
+                    pendingAudioChunks.push(monoSamples.slice().buffer);
                 }
                 audioPacketCount += 1;
                 if (audioPacketCount % 100 === 0) {
@@ -420,13 +505,24 @@
                 pc = null;
             }
             video.srcObject = null;
+            if (scriptNode) {
+                try { scriptNode.disconnect(); } catch (e) {}
+                scriptNode.onaudioprocess = null;
+                scriptNode = null;
+            }
+            if (audioNode) {
+                try { audioNode.disconnect(); } catch (e) {}
+                audioNode = null;
+            }
             if (audioContext) {
                 audioContext.close().catch(() => {});
                 audioContext = null;
             }
-            audioNode = null;
             audioGainNode = null;
             audioWorkletReady = false;
+            audioPlaybackReady = false;
+            audioUseScriptProcessor = false;
+            resetAudioRing();
             pendingAudioChunks = [];
             status.textContent = 'Disconnected';
             status.className = '';
