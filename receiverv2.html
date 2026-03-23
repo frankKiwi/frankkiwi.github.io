@@ -30,7 +30,7 @@
     </style>
 </head>
 <body>
-    <!-- 默认 muted 便于自动播放；收到 m=audio 后在 ontrack 里再 muted=false -->
+    <!-- 默认 muted 便于自动播放；应用内声走 AUD0，不依赖 m=audio -->
     <video id="video" autoplay playsinline muted></video>
     <div id="status">Waiting for connection...</div>
 
@@ -498,13 +498,7 @@
                         status.classList.add('hidden');
                     }, 3000);
                 }
-                if (event.track.kind === 'audio') {
-                    event.track.enabled = true;
-                    video.muted = false;
-                    console.log('WebRTC m=audio 轨已绑定，video.muted=false（与 AUD0 应用内声可并存）');
-                    video.play().catch(() => {});
-                    forceUnlockWebAudio();
-                }
+                // 不处理 m=audio：应用内声音由 AUD0 + WebAudio 播放
             };
 
             pc.onicecandidate = (event) => {
