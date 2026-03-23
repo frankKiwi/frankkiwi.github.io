@@ -58,7 +58,23 @@
         var ringBuf = new Float32Array(ringCap);
         var ringRead = 0, ringWrite = 0, ringCount = 0;
         var ringStarted = false;
-        var ringStartThreshold = 9600;
+        var ringStartThreshold = 480;
+
+        async function forceUnlockWebAudio() {
+            try {
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                        latencyHint: 'interactive',
+                        sampleRate: 48000
+                    });
+                }
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+            } catch (e) {
+                console.warn('forceUnlockWebAudio:', e);
+            }
+        }
 
         function resetAudioRing() {
             ringRead = ringWrite = ringCount = 0;
@@ -106,6 +122,7 @@
                 signalingServerIP = data.signalingIP;
                 signalingServerPort = Number(data.signalingPort || 1118);
                 status.textContent = 'Connecting WebRTC...';
+                forceUnlockWebAudio();
                 connectWebRTC(signalingServerIP, signalingServerPort);
             } else if (data.type === 'stop') {
                 closeWebRTC();
@@ -116,6 +133,18 @@
         const options = new cast.framework.CastReceiverOptions();
         options.disableIdleTimeout = true;
         context.start(options);
+
+        try {
+            const sysEt = cast.framework && cast.framework.system && cast.framework.system.EventType;
+            if (sysEt && sysEt.READY) {
+                context.addEventListener(sysEt.READY, () => {
+                    console.log('Cast system READY — unlock WebAudio');
+                    forceUnlockWebAudio();
+                });
+            }
+        } catch (e) {
+            console.warn('Cast READY listener:', e);
+        }
 
         console.log('Cast Receiver started');
 
@@ -131,6 +160,7 @@
             ws.onopen = () => {
                 console.log('WebSocket connected');
                 status.textContent = 'Signaling connected, waiting for stream...';
+                forceUnlockWebAudio();
                 createPeerConnection();
                 ws.send(JSON.stringify({ type: 'ready' }));
                 startHeartbeat();
@@ -169,6 +199,7 @@
         }
 
         async function ensureAudioPipeline() {
+            await forceUnlockWebAudio();
             if (audioPlaybackReady && audioContext) {
                 if (audioContext.state === 'suspended') {
                     await audioContext.resume();
@@ -181,6 +212,7 @@
                     sampleRate: 48000
                 });
             }
+            await forceUnlockWebAudio();
 
             if (!audioUseScriptProcessor) {
                 try {
@@ -194,7 +226,7 @@
                         this.writeIndex = 0;
                         this.count = 0;
                         this.started = false;
-                        this.startThreshold = 4800;
+                        this.startThreshold = 480;
                         this.underruns = 0;
                         this.port.onmessage = (event) => {
                             const msg = event.data || {};
@@ -264,7 +296,7 @@
                             console.warn('Audio underrun count:', event.data.count);
                         }
                     };
-                    audioNode.port.postMessage({ type: 'config', startThreshold: 9600 });
+                    audioNode.port.postMessage({ type: 'config', startThreshold: 480 });
 
                     audioGainNode = audioContext.createGain();
                     audioGainNode.gain.value = 1.0;
@@ -373,8 +405,8 @@
                     pendingAudioChunks.push(monoSamples.slice().buffer);
                 }
                 audioPacketCount += 1;
-                if (audioPacketCount % 100 === 0) {
-                    console.log('Audio packets played:', audioPacketCount, 'rate:', sampleRate, 'ch:', channels);
+                if (audioPacketCount <= 3 || audioPacketCount % 100 === 0) {
+                    console.log('AUD0 rx', audioPacketCount, 'bytes', arrayBuffer.byteLength, 'ctx', audioContext && audioContext.state);
                 }
             } catch (error) {
                 console.error('Audio chunk handling failed:', error);
@@ -416,7 +448,8 @@
                 if (event.track.kind === 'video') {
                     // 先保证视频自动播放稳定，音频走独立 AudioContext 通道
                     video.muted = true;
-                    video.play().catch(e => console.error('Playback failed:', e));
+                    video.play().then(() => forceUnlockWebAudio()).catch(e => console.error('Playback failed:', e));
+                    forceUnlockWebAudio();
                     status.textContent = 'Playing';
                     status.className = 'connected';
 
