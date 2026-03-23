@@ -439,6 +439,20 @@
 
             pc = new RTCPeerConnection(config);
 
+            // 与扩展一致：AUD0 PCM 优先走 WebRTC DataChannel（SCTP），避免 WebSocket 二进制在部分 Cast/浏览器上丢失
+            pc.ondatachannel = (ev) => {
+                const ch = ev.channel;
+                console.log('[mirror-audio] DataChannel label=', ch.label, 'id=', ch.id);
+                ch.binaryType = 'arraybuffer';
+                ch.onopen = () => console.log('[mirror-audio] open');
+                ch.onerror = (e) => console.error('[mirror-audio] error', e);
+                ch.onmessage = async (e) => {
+                    if (e.data instanceof ArrayBuffer) {
+                        await handleBinaryAudio(e.data);
+                    }
+                };
+            };
+
             pc.ontrack = (event) => {
                 console.log('Media track received:', event.track.kind);
                 if (event.streams && event.streams[0] && video.srcObject !== event.streams[0]) {
