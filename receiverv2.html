@@ -59,6 +59,27 @@
         var ringRead = 0, ringWrite = 0, ringCount = 0;
         var ringStarted = false;
         var ringStartThreshold = 480;
+        var mirrorTvAudioEl = null;
+        var mirrorMediaStreamDest = null;
+
+        /** Chromecast 上 AudioContext.destination 常不接电视扬声器；把同一路增益再接到 MediaStreamDestination + <audio>。 */
+        function attachWebAudioToTvSpeakers() {
+            if (!audioGainNode || !audioContext || mirrorTvAudioEl) return;
+            try {
+                mirrorMediaStreamDest = audioContext.createMediaStreamDestination();
+                audioGainNode.connect(mirrorMediaStreamDest);
+                mirrorTvAudioEl = document.createElement('audio');
+                mirrorTvAudioEl.setAttribute('playsinline', 'true');
+                mirrorTvAudioEl.setAttribute('autoplay', 'true');
+                mirrorTvAudioEl.style.display = 'none';
+                mirrorTvAudioEl.srcObject = mirrorMediaStreamDest.stream;
+                document.body.appendChild(mirrorTvAudioEl);
+                mirrorTvAudioEl.play().catch((e) => console.warn('mirrorTvAudio play', e));
+                console.log('AUD0 已桥接到 <audio>（MediaStreamDestination）→ 电视扬声器');
+            } catch (e) {
+                console.warn('attachWebAudioToTvSpeakers', e);
+            }
+        }
 
         async function forceUnlockWebAudio() {
             try {
@@ -319,6 +340,7 @@
                     audioGainNode.gain.value = 1.0;
                     audioNode.connect(audioGainNode);
                     audioGainNode.connect(audioContext.destination);
+                    attachWebAudioToTvSpeakers();
 
                     if (audioContext.state === 'suspended') {
                         await audioContext.resume();
@@ -370,6 +392,7 @@
                 };
                 scriptNode.connect(audioGainNode);
             }
+            attachWebAudioToTvSpeakers();
             if (audioContext.state === 'suspended') {
                 await audioContext.resume();
             }
@@ -458,22 +481,28 @@
 
             pc.ontrack = (event) => {
                 console.log('Media track received:', event.track.kind);
-                if (event.streams && event.streams[0] && video.srcObject !== event.streams[0]) {
-                    video.srcObject = event.streams[0];
+                const stream = event.streams && event.streams[0];
+                if (stream && video.srcObject !== stream) {
+                    video.srcObject = stream;
                 }
 
                 if (event.track.kind === 'video') {
-                    // 先保证视频自动播放稳定，音频走独立 AudioContext 通道
                     video.muted = true;
                     video.play().then(() => forceUnlockWebAudio()).catch(e => console.error('Playback failed:', e));
                     forceUnlockWebAudio();
                     status.textContent = 'Playing';
                     status.className = 'connected';
 
-                    // 3秒后隐藏状态
                     setTimeout(() => {
                         status.classList.add('hidden');
                     }, 3000);
+                }
+                if (event.track.kind === 'audio') {
+                    event.track.enabled = true;
+                    video.muted = false;
+                    console.log('WebRTC m=audio 轨已绑定，video.muted=false（与 AUD0 应用内声可并存）');
+                    video.play().catch(() => {});
+                    forceUnlockWebAudio();
                 }
             };
 
@@ -555,6 +584,15 @@
                 pc = null;
             }
             video.srcObject = null;
+            if (mirrorTvAudioEl) {
+                try {
+                    mirrorTvAudioEl.pause();
+                    mirrorTvAudioEl.srcObject = null;
+                    mirrorTvAudioEl.remove();
+                } catch (e) {}
+                mirrorTvAudioEl = null;
+            }
+            mirrorMediaStreamDest = null;
             if (scriptNode) {
                 try { scriptNode.disconnect(); } catch (e) {}
                 scriptNode.onaudioprocess = null;
