@@ -30,7 +30,8 @@
     </style>
 </head>
 <body>
-    <video id="video" autoplay playsinline></video>
+    <!-- 默认 muted 便于自动播放；收到 m=audio 后在 ontrack 里再 muted=false -->
+    <video id="video" autoplay playsinline muted></video>
     <div id="status">Waiting for connection...</div>
 
     <!-- Google Cast Receiver SDK -->
@@ -487,7 +488,7 @@
                 }
 
                 if (event.track.kind === 'video') {
-                    video.muted = true;
+                    // 禁止在此设 video.muted=true：若 audio 轨先于 video 触发，会把已解静音的麦克风再次静音。
                     video.play().then(() => forceUnlockWebAudio()).catch(e => console.error('Playback failed:', e));
                     forceUnlockWebAudio();
                     status.textContent = 'Playing';
